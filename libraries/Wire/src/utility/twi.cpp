@@ -44,7 +44,7 @@ typedef enum {
     I2C_NUM
 } internal_i2c_index_t;
 
-static struct i2c_s *obj_s_buf[I2C_NUM] = {NULL};
+static i2c_t* obj_s_buf[I2C_NUM] = {NULL};
 
 #ifndef WIRE_I2C_FLAG_TIMEOUT
 #define WIRE_I2C_FLAG_TIMEOUT  (0xF0000U)
@@ -161,8 +161,8 @@ void i2c_slaves_interrupt_enable(i2c_t *obj)
             nvic_irq_enable(I2C0_EV_IRQn, 1, 3);
             nvic_irq_enable(I2C0_ER_IRQn, 1, 2);
 #else 
-            nvic_irq_enable(I2C0_EV_IRQn, 1);
-            nvic_irq_enable(I2C0_ER_IRQn, 1);
+            nvic_irq_enable(I2C0_EV_IRQn, 0);
+            nvic_irq_enable(I2C0_ER_IRQn, 0);
 #endif           
             break;
         case I2C1:
@@ -171,8 +171,8 @@ void i2c_slaves_interrupt_enable(i2c_t *obj)
             nvic_irq_enable(I2C1_EV_IRQn, 1, 3);
             nvic_irq_enable(I2C1_ER_IRQn, 1, 2);
 #else 
-            nvic_irq_enable(I2C1_EV_IRQn, 1);
-            nvic_irq_enable(I2C1_ER_IRQn, 1);
+            nvic_irq_enable(I2C1_EV_IRQn, 0);
+            nvic_irq_enable(I2C1_ER_IRQn, 0);
 #endif           
             break;
 #ifdef I2C2
@@ -614,7 +614,7 @@ void i2c_err_handler(uint32_t i2c)
         i2c_interrupt_flag_clear(i2c, I2C_INT_FLAG_PECERR);
     }
 }
-
+// extern volatile uint8_t data[4];
 volatile uint8_t snd_count;
 volatile uint8_t rx_count;
 volatile bool is_transmitter = false;
@@ -645,19 +645,32 @@ static void i2c_irq(struct i2c_s *obj_s)
         }
     }
 
+    // if (i2c_interrupt_flag_get(i2c, I2C_INT_FLAG_RBNE)) {
+    //     /* if reception data register is not empty, I2C1 will read a data from I2C_DATA */
+    //     /* also check that our RX buffer has enough space for it */
+    //     if (rx_count < obj_s->tx_rx_buffer_size)
+    //     {
+    //         *(obj_s->rx_buffer_ptr + rx_count++) = i2c_data_receive(i2c);   
+    //     }
+    // }
+
     if (is_transmitter)
     {
-        if ((i2c_interrupt_flag_get(i2c, I2C_INT_FLAG_TBE)) &&
-            (!i2c_interrupt_flag_get(i2c, I2C_INT_FLAG_AERR)))
+        if (i2c_interrupt_flag_get(i2c, I2C_INT_FLAG_TBE))
         {
             /* Send a data byte */
-            if (snd_count < obj_s->tx_count)
-            {
-                i2c_data_transmit(i2c, *(obj_s->tx_buffer_ptr + snd_count++));
-            }
+            // if (snd_count < obj_s->tx_count)
+            // {
+            //     i2c_data_transmit(i2c, *(obj_s->tx_buffer_ptr + snd_count++));
+            // }
+            // i2c_data_transmit(i2c, *(data + snd_count++));
+            // i2c_data_transmit(i2c, 0xaa + snd_count++);
+            i2c_data_transmit(i2c, 0xaa + snd_count++);
         }
-        else {
-            i2c_interrupt_flag_clear(i2c, I2C_INT_FLAG_AERR);
+        
+        if (i2c_interrupt_flag_get(i2c, I2C_INT_FLAG_TBE))
+        {
+            i2c_data_transmit(i2c, 0xaa + snd_count++);
         }
     }
     else {
@@ -673,12 +686,80 @@ static void i2c_irq(struct i2c_s *obj_s)
     }
     
     if (i2c_interrupt_flag_get(i2c, I2C_INT_FLAG_STPDET)) {
+        /* clear the STPDET bit */
+        i2c_enable(i2c);
+
         if (!is_transmitter) {            
             obj_s->slave_receive_callback(obj_s->pWireObj, (uint8_t*)obj_s->rx_buffer_ptr, rx_count); // onReceiveService
         }
+        is_transmitter = false;
         
-        /* clear the STPDET bit */
-        i2c_enable(i2c);
+    }
+}
+
+volatile uint8_t tx_idx = 0;
+volatile bool bUseCmd = false;
+volatile uint8_t data[4];
+extern volatile uint8_t reg_status;
+extern volatile uint8_t* read_ptr;
+extern volatile uint8_t new_data_ready;
+
+void I2C0_IRQHandler(void) {
+    /* 1. 地址匹配中断 (Address Matched) */
+    if (i2c_interrupt_flag_get(I2C0, I2C_INT_FLAG_ADDSEND)) {
+        /* 清除 ADDSEND 位 (通过读 STAT0 和 STAT1) */
+        i2c_interrupt_flag_clear(I2C0, I2C_INT_FLAG_ADDSEND);
+        
+        /* 检查当前是从机接收(主机写)还是从机发送(主机读) */
+        if (i2c_flag_get(I2C0, GD32_I2C_FLAG_IS_TRANSMTR_OR_RECVR)) {
+            // 从机发送模式 (主机要读数据)
+            tx_idx = 0; // 重置发送索引
+            // 可以在这里根据 current_cmd 决定准备什么数据到 i2c_tx_buffer
+            if(new_data_ready) {
+                memcpy((uint8_t*)data, (uint8_t*)read_ptr, 4);
+                new_data_ready = 0;
+            }
+        }
+    }
+
+    /* 2. 接收中断 (Receive Buffer Not Empty) - 主机写数据给从机 */
+    if (i2c_interrupt_flag_get(I2C0, I2C_INT_FLAG_RBNE)) {
+        bUseCmd = true;
+        uint8_t cmd = i2c_data_receive(I2C0);
+        if (cmd == 0x00) {
+            // 接收到度量指令后，重新标识为新鲜
+            reg_status = 0b00;
+            data[0] = (data[0] & 0x3F); // status = OK
+        }
+    }
+
+    /* 3. 发送中断 (Transmit Buffer Empty) - 主机读从机数据 */
+    if (i2c_interrupt_flag_get(I2C0, I2C_INT_FLAG_TBE)) {
+        do {
+            if(tx_idx < 4) {
+                i2c_data_transmit(I2C0, data[tx_idx++]);
+            }
+            else {
+                // 无数据可发送时，发送0xff，适配PX4
+                i2c_data_transmit(I2C0, 0xFF);
+            }
+        } while (i2c_interrupt_flag_get(I2C0, I2C_INT_FLAG_TBE));
+
+        // if (bUseCmd && tx_idx == 4) { // 读取一次后数据标识为不新鲜
+        //     // status = STALE = 0b10  
+        //     //          0x80  = 0b10xx xxxx 
+        //     data[0] = 0x80 | (data[0] & 0x3F);
+        // }
+        data[0] = 0x80 | (data[0] & 0x3F);
+    }
+
+    /* 4. 停止位检测 (Stop Condition Detected) */
+    if (i2c_interrupt_flag_get(I2C0, I2C_INT_FLAG_STPDET)) {
+        /* 清除 STPDET (写 STAT0 后读 CTL0) */
+        i2c_enable(I2C0); // 简单处理：重新使能以清除标志位并释放总线
+        
+        // 此处可以设置一个全局标志，通知 main 函数：一个完整的包收到了/发完了
+        tx_idx = 0;
     }
 }
 
@@ -688,7 +769,8 @@ static void i2c_irq(struct i2c_s *obj_s)
  */
 extern "C" void I2C0_EV_IRQHandler(void)
 {
-    i2c_irq(obj_s_buf[I2C0_INDEX]);
+    // i2c_irq(obj_s_buf[I2C0_INDEX]);
+    I2C0_IRQHandler();
 }
 
 /** handle I2C0 error interrupt request
